@@ -1,0 +1,918 @@
+﻿import os
+import time
+import json
+import asyncio
+import requests
+import threading
+import re
+import subprocess
+import traceback
+import hashlib
+from urllib.parse import quote_plus
+import imageio_ffmpeg
+
+# Прописываем путь к ffmpeg в переменные среды ДО импорта pydub/shazamio, чтобы убрать RuntimeWarning
+FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
+os.environ["PATH"] += os.pathsep + os.path.dirname(FFMPEG_PATH)
+
+from telebot import TeleBot, types, apihelper
+from yt_dlp import YoutubeDL
+from shazamio import Shazam
+
+# Увеличиваем глобальные таймауты для отправки тяжелых файлов (по умолчанию 15 сек)
+apihelper.READ_TIMEOUT = 120
+apihelper.CONNECT_TIMEOUT = 30
+
+BOT_TOKEN = "8983080155:AAHQ9ZDw1N7TZhkEIvOIzl5ySlhhG1k_u68"
+bot = TeleBot(BOT_TOKEN, num_threads=16)
+
+DOWNLOAD_DIR = "downloads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+video_cache = {}
+text_search_cache = {}
+search_session_cache = {}
+shazam_video_cache = {}
+
+STORAGE_FILE = "storage_chat_id.txt"
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+}
+
+http_session = requests.Session()
+http_session.headers.update(HEADERS)
+
+
+def get_storage_chat_id():
+    if os.path.exists(STORAGE_FILE):
+        try:
+            with open(STORAGE_FILE, "r") as f:
+                return int(f.read().strip())
+        except Exception:
+            pass
+    return None
+
+
+def save_storage_chat_id(chat_id):
+    try:
+        with open(STORAGE_FILE, "w") as f:
+            f.write(str(chat_id))
+    except Exception:
+        pass
+
+
+E_DL   = '<tg-emoji emoji-id="6039802767931871481">\U00002b07\U0000fe0f</tg-emoji>'
+E_SEND = '<tg-emoji emoji-id="5377811534384768829">\U0001f4e4</tg-emoji>'
+E_WAVE = '<tg-emoji emoji-id="5260607902716036593">\U0001f44b</tg-emoji>'
+
+
+def get_video_duration(video_path):
+    try:
+        result = subprocess.run(
+            [FFMPEG_PATH, "-i", video_path],
+            capture_output=True, text=True, timeout=8
+        )
+        for line in result.stderr.split('\n'):
+            if 'Duration' in line:
+                m = re.search(r'Duration:\s*(\d+):(\d+):(\d+)', line)
+                if m:
+                    h, mi, s = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                    return h * 3600 + mi * 60 + s
+    except Exception:
+        pass
+    return 0
+
+
+def extract_audio_segment(video_path, audio_path, ss=None, t=None):
+    cmd = [FFMPEG_PATH, "-y"]
+    if ss is not None:
+        cmd += ["-ss", str(ss)]
+    cmd += ["-i", video_path]
+    if t is not None:
+        cmd += ["-t", str(t)]
+    cmd += ["-vn", "-acodec", "libmp3lame", "-q:a", "4", audio_path]
+    try:
+        subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if os.path.exists(audio_path) and os.path.getsize(audio_path) > 1000:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def shazam_recognize(audio_path):
+    loop = asyncio.new_event_loop()
+    try:
+        shazam = Shazam()
+        result = loop.run_until_complete(shazam.recognize(audio_path))
+        matches = result.get("matches", [])
+        if not matches:
+            return None
+        track = result.get("track", {})
+        if not track:
+            return None
+        return {
+            "title": track.get("title", ""),
+            "artist": track.get("subtitle", ""),
+            "artwork": track.get("images", {}).get("coverarthq", ""),
+            "url": track.get("url", ""),
+        }
+    except Exception:
+        return None
+    finally:
+        loop.close()
+
+
+def extract_and_recognize(video_path):
+    duration = get_video_duration(video_path)
+    base = os.path.splitext(video_path)[0]
+
+    segments = []
+    if duration > 10:
+        segments.append(("start", 0, 12))
+        mid = max(0, duration // 2 - 6)
+        segments.append(("middle", mid, 12))
+        if duration > 20:
+            segments.append(("late", max(0, duration - 15), 12))
+    else:
+        segments.append(("full", None, None))
+
+    for name, ss, t in segments:
+        audio_path = f"{base}_shazam_{name}.mp3"
+        if extract_audio_segment(video_path, audio_path, ss, t):
+            result = shazam_recognize(audio_path)
+            try:
+                os.remove(audio_path)
+            except Exception:
+                pass
+            if result and result.get("title"):
+                return result
+
+    return None
+
+
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    save_storage_chat_id(message.chat.id)
+    bot.send_message(
+        message.chat.id,
+        f'{E_WAVE} <b>Привет!</b>\n\n'
+        f'• Отправь видео (или ответь на видео словом <b>найти</b> в чате), и я распознаю трек.\n'
+        f'• Скинь ссылку (TikTok, YouTube, Instagram, Pinterest, SoundCloud), и я скачаю материал.',
+        parse_mode="HTML"
+    )
+
+
+def clean_search_query(query):
+    cleaned = re.sub(
+        r'^/?(?:найти|найди|поиск|ищи|скачать|скачай|шазам|shazam|песня|трек|музыка)(?:@\S+)?\s*',
+        '',
+        query.strip(),
+        flags=re.IGNORECASE
+    ).strip()
+    return cleaned
+
+
+def clean_track_display_title(raw_title):
+    cleaned = re.sub(
+        r'(?i)\s*[\(\[](?:official\s*(?:music\s*)?(?:video|audio|lyric\s*video|visualizer)|lyrics?|текст\s*песни|клип|hd|4k|hq|audio)[\)\]]',
+        '',
+        raw_title
+    )
+    return cleaned.strip() or raw_title.strip()
+
+
+def split_artist_title(raw_title, fallback_uploader):
+    cleaned_title = clean_track_display_title(raw_title)
+    uploader = re.sub(r'(?i)\s*-\s*topic$', '', (fallback_uploader or '')).strip()
+
+    for sep in [" — ", " - ", " – "]:
+        if sep in cleaned_title:
+            parts = cleaned_title.split(sep, 1)
+            return parts[0].strip(), parts[1].strip()
+
+    return (uploader or "Artist"), cleaned_title
+
+
+def search_youtube_tracks(query, limit=25):
+    clean_q = clean_search_query(query) or query.strip()
+    tracks = []
+    seen_labels = set()
+
+    ydl_opts = {
+        'extract_flat': 'in_playlist',
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'http_headers': HEADERS,
+    }
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{limit}:{clean_q}", download=False)
+            entries = info.get('entries', []) if info else []
+            for entry in entries:
+                if not entry:
+                    continue
+                raw_title = (entry.get('title') or '').strip()
+                uploader = (entry.get('uploader') or entry.get('channel') or 'YouTube').strip()
+                url = entry.get('url') or entry.get('webpage_url') or entry.get('id') or ''
+                if url and not url.startswith('http'):
+                    url = f"https://www.youtube.com/watch?v={url}"
+
+                duration = int(entry.get('duration') or 0)
+                if duration > 1200:
+                    continue
+
+                thumbs = entry.get('thumbnails') or []
+                thumbnail = thumbs[-1].get('url', '') if thumbs else (entry.get('thumbnail') or '')
+
+                if raw_title and url:
+                    artist, title = split_artist_title(raw_title, uploader)
+                    display_label = f"{artist} — {title}" if artist.lower() not in title.lower() else title
+                    norm_key = display_label.lower()
+                    if norm_key in seen_labels and len(tracks) > 6:
+                        continue
+                    seen_labels.add(norm_key)
+
+                    t_id = hashlib.md5(f"{url}_{len(tracks)}".encode()).hexdigest()[:14]
+                    track_obj = {
+                        'id': t_id,
+                        'title': title,
+                        'artist': artist,
+                        'display': display_label,
+                        'url': url,
+                        'artwork': thumbnail,
+                        'duration': duration
+                    }
+                    text_search_cache[t_id] = track_obj
+                    tracks.append(track_obj)
+    except Exception:
+        traceback.print_exc()
+    return tracks
+
+
+def build_search_keyboard(session_id, page=0, per_page=9):
+    session = search_session_cache.get(session_id)
+    if not session:
+        return None
+
+    tracks = session['tracks']
+    start = page * per_page
+    end = start + per_page
+    slice_tracks = tracks[start:end]
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+
+    for idx, track in enumerate(slice_tracks):
+        dur = track['duration']
+        dur_str = f"{dur // 60}:{dur % 60:02d}" if dur > 0 else ""
+
+        if idx == 0 and dur_str:
+            btn_text = f"• {dur_str} • {track['display']}"
+        elif dur_str:
+            btn_text = f"{track['display']} ({dur_str})"
+        else:
+            btn_text = track['display']
+
+        if len(btn_text) > 58:
+            btn_text = btn_text[:55] + "..."
+
+        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"pick:{track['id']}"))
+
+    if end < len(tracks):
+        next_page = page + 1
+        try:
+            more_btn = types.InlineKeyboardButton("➕ Больше треков", callback_data=f"more:{session_id}:{next_page}", style="success")
+        except TypeError:
+            more_btn = types.InlineKeyboardButton("➕ Больше треков", callback_data=f"more:{session_id}:{next_page}")
+        markup.add(more_btn)
+
+    return markup
+
+
+def show_track_selection(message, query_text, status_msg=None):
+    chat_id = message.chat.id
+    if not status_msg:
+        status_msg = bot.reply_to(message, "🔎", reply_markup=None)
+
+    def do_search():
+        try:
+            tracks = search_youtube_tracks(query_text, limit=25)
+            if not tracks:
+                bot.edit_message_text("❌ Ничего не найдено", chat_id, status_msg.message_id)
+                return
+
+            session_id = hashlib.md5(f"{chat_id}_{status_msg.message_id}_{query_text}".encode()).hexdigest()[:12]
+            search_session_cache[session_id] = {
+                'query': query_text,
+                'tracks': tracks
+            }
+
+            markup = build_search_keyboard(session_id, page=0, per_page=9)
+            bot.edit_message_text(
+                "🔎",
+                chat_id,
+                status_msg.message_id,
+                reply_markup=markup
+            )
+        except Exception:
+            traceback.print_exc()
+            try:
+                bot.edit_message_text("❌ Ошибка поиска", chat_id, status_msg.message_id)
+            except Exception:
+                pass
+
+    threading.Thread(target=do_search, daemon=True).start()
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("more:"))
+def handle_more_tracks(call):
+    parts = call.data.split(":")
+    session_id = parts[1]
+    page = int(parts[2])
+    chat_id = call.message.chat.id
+
+    session = search_session_cache.get(session_id)
+    if not session:
+        bot.answer_callback_query(call.id, "❌ Поиск устарел, повтори запрос")
+        return
+
+    markup = build_search_keyboard(session_id, page=page, per_page=9)
+    if not markup:
+        bot.answer_callback_query(call.id, "Больше треков нет")
+        return
+
+    bot.answer_callback_query(call.id)
+    try:
+        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=markup)
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("pick:"))
+def handle_picked_track(call):
+    track_id = call.data.split(":", 1)[1]
+    chat_id = call.message.chat.id
+    track_info = text_search_cache.get(track_id)
+
+    if not track_info:
+        bot.answer_callback_query(call.id, "❌ Поиск устарел, введи запрос заново")
+        return
+
+    bot.answer_callback_query(call.id, f"⏳ Скачиваю: {track_info['title']}")
+
+    reply_target = call.message.reply_to_message.message_id if call.message.reply_to_message else None
+
+    # Удаляем сообщение с лупой и кнопками выбора треков
+    try:
+        bot.delete_message(chat_id, call.message.message_id)
+    except Exception:
+        pass
+
+    def do_download():
+        song_path = None
+        try:
+            dl_res = download_song_ytdlp(track_info['url'])
+            if not dl_res or not os.path.exists(dl_res['path']):
+                bot.send_message(chat_id, "❌ Не удалось скачать трек", reply_to_message_id=reply_target)
+                return
+
+            song_path = dl_res['path']
+            send_downloaded_song(
+                chat_id,
+                reply_target,
+                dl_res,
+                override_title=track_info['title'],
+                override_artist=track_info['artist'],
+                override_art=track_info.get('artwork')
+            )
+        except Exception:
+            traceback.print_exc()
+            try:
+                bot.send_message(chat_id, "❌ Ошибка при отправке трека (превышен лимит ожидания сети)")
+            except Exception:
+                pass
+        finally:
+            if song_path and os.path.exists(song_path):
+                try:
+                    os.remove(song_path)
+                except Exception:
+                    pass
+
+    threading.Thread(target=do_download, daemon=True).start()
+
+
+def download_song_ytdlp(query_or_url):
+    h = hashlib.md5(query_or_url.encode()).hexdigest()[:10]
+    out_path = os.path.join(DOWNLOAD_DIR, f"song_{h}.%(ext)s")
+    target = query_or_url if query_or_url.startswith('http') else f"ytsearch1:{query_or_url}"
+    ydl_opts = {
+        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+        'outtmpl': out_path,
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'ffmpeg_location': FFMPEG_PATH,
+        'concurrent_fragment_downloads': 8,
+        'socket_timeout': 15,
+        'retries': 3,
+        'http_headers': HEADERS,
+    }
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(target, download=True)
+            if not info:
+                return None
+            if 'entries' in info:
+                entries = [e for e in info['entries'] if e]
+                if not entries:
+                    return None
+                info = entries[0]
+
+            filename = ydl.prepare_filename(info)
+            base, _ = os.path.splitext(filename)
+
+            final_path = None
+            for ext in [".m4a", ".mp3", ".ogg", ".opus", ".webm"]:
+                if os.path.exists(base + ext):
+                    final_path = base + ext
+                    break
+            if not final_path and os.path.exists(filename):
+                final_path = filename
+
+            if final_path and final_path.endswith((".webm", ".opus")):
+                mp3_out = base + ".mp3"
+                subprocess.run(
+                    [FFMPEG_PATH, "-y", "-i", final_path, "-vn", "-acodec", "libmp3lame", "-q:a", "4", mp3_out],
+                    capture_output=True, timeout=40
+                )
+                if os.path.exists(mp3_out):
+                    try:
+                        os.remove(final_path)
+                    except Exception:
+                        pass
+                    final_path = mp3_out
+
+            if final_path and os.path.exists(final_path):
+                raw_title = (info.get('title') or '').strip()
+                uploader = (info.get('artist') or info.get('uploader') or info.get('channel') or '').strip()
+                artist, title = split_artist_title(raw_title, uploader)
+                if info.get('track') and info.get('artist'):
+                    title = info.get('track')
+                    artist = info.get('artist')
+
+                thumbs = info.get('thumbnails') or []
+                thumb = info.get('thumbnail') or (thumbs[-1].get('url', '') if thumbs else '')
+                return {
+                    'path': final_path,
+                    'title': title,
+                    'artist': artist,
+                    'thumbnail': thumb
+                }
+    except Exception:
+        traceback.print_exc()
+    return None
+
+
+def send_downloaded_song(chat_id, reply_to_message_id, dl_res, override_title=None, override_artist=None, override_art=None):
+    thumb_bytes = None
+    art_url = override_art or dl_res.get('thumbnail')
+    if art_url:
+        try:
+            r = http_session.get(art_url, timeout=5)
+            # Telegram принимает обложки до 200 КБ (желательно JPG)
+            if r.status_code == 200 and len(r.content) < 200 * 1024:
+                thumb_bytes = r.content
+        except Exception:
+            pass
+
+    title = override_title or dl_res.get('title') or "Track"
+    performer = override_artist or dl_res.get('artist') or "Artist"
+
+    # Делаем до 3 попыток отправки на случай SSL/ReadTimeout ошибок сети
+    last_err = None
+    for attempt in range(3):
+        try:
+            with open(dl_res['path'], "rb") as f:
+                bot.send_audio(
+                    chat_id,
+                    f,
+                    title=title,
+                    performer=performer,
+                    thumbnail=thumb_bytes if attempt == 0 else None,  # На 2-й попытке пробуем без обложки
+                    reply_to_message_id=reply_to_message_id,
+                    allow_sending_without_reply=True,
+                    timeout=120
+                )
+            return
+        except Exception as e:
+            last_err = e
+            print(f"[Попытка {attempt + 1}/3] Ошибка отправки аудио: {e}")
+            time.sleep(2)
+
+    if last_err:
+        raise last_err
+
+
+def recognize_and_show_options(message, status_msg, media_path, delete_source=False):
+    chat_id = message.chat.id
+    try:
+        result = extract_and_recognize(media_path)
+        if not result or not result.get("title"):
+            bot.edit_message_text("❌ Не удалось определить музыку", chat_id, status_msg.message_id)
+            return
+
+        query = f"{result['artist']} — {result['title']}"
+        show_track_selection(message, query, status_msg=status_msg)
+    except Exception:
+        traceback.print_exc()
+        try:
+            bot.edit_message_text("❌ Ошибка при определении музыки", chat_id, status_msg.message_id)
+        except Exception:
+            pass
+    finally:
+        if delete_source and media_path and os.path.exists(media_path):
+            try:
+                os.remove(media_path)
+            except Exception:
+                pass
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("shazam:"))
+def handle_shazam(call):
+    video_id = call.data.split(":", 1)[1]
+    chat_id = call.message.chat.id
+    video_path = shazam_video_cache.get(video_id)
+
+    if not video_path or not os.path.exists(video_path):
+        bot.answer_callback_query(call.id, "❌ Видео уже удалено, скачай заново")
+        return
+
+    bot.answer_callback_query(call.id, "🎵 Определяю музыку...")
+
+    try:
+        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+    except Exception:
+        pass
+
+    status_msg = bot.send_message(chat_id, "🔎", reply_to_message_id=call.message.reply_to_message.message_id if call.message.reply_to_message else call.message.message_id)
+
+    threading.Thread(
+        target=recognize_and_show_options,
+        args=(call.message, status_msg, video_path, False),
+        daemon=True
+    ).start()
+
+
+def extract_telegram_media_file_id(msg):
+    if not msg:
+        return None
+    if msg.video:
+        return msg.video.file_id
+    if msg.video_note:
+        return msg.video_note.file_id
+    if msg.voice:
+        return msg.voice.file_id
+    if msg.audio:
+        return msg.audio.file_id
+    if msg.document and msg.document.mime_type and (
+        msg.document.mime_type.startswith("video/") or msg.document.mime_type.startswith("audio/")
+    ):
+        return msg.document.file_id
+    return None
+
+
+def handle_telegram_media_shazam(message, target_msg):
+    chat_id = message.chat.id
+    file_id = extract_telegram_media_file_id(target_msg)
+    if not file_id:
+        return
+
+    status_msg = bot.reply_to(message, "🔎")
+
+    def worker():
+        local_path = os.path.join(DOWNLOAD_DIR, f"tg_media_{chat_id}_{target_msg.message_id}.mp4")
+        try:
+            file_info = bot.get_file(file_id)
+            downloaded = bot.download_file(file_info.file_path)
+            with open(local_path, "wb") as f:
+                f.write(downloaded)
+            recognize_and_show_options(message, status_msg, local_path, delete_source=True)
+        except Exception:
+            traceback.print_exc()
+            try:
+                bot.edit_message_text("❌ Не удалось обработать файл", chat_id, status_msg.message_id)
+            except Exception:
+                pass
+            if os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                except Exception:
+                    pass
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+@bot.message_handler(content_types=['video', 'video_note', 'voice', 'document'])
+def handle_direct_media(message):
+    if not extract_telegram_media_file_id(message):
+        return
+    is_private = message.chat.type == 'private'
+    caption = (message.caption or '').strip()
+    is_trigger = bool(re.match(r'^/?(?:найти|найди|шазам|shazam|трек|песня)\b', caption, flags=re.IGNORECASE))
+
+    if is_private or is_trigger:
+        handle_telegram_media_shazam(message, message)
+
+
+def download_tiktok_api(url, output_path):
+    try:
+        res = http_session.get(f"https://tikwm.com/api/?url={quote_plus(url)}", timeout=8).json()
+        if res.get("code") == 0:
+            video_url = res["data"].get("play") or res["data"].get("hdplay")
+            if video_url:
+                r = http_session.get(video_url, timeout=15)
+                if r.status_code == 200:
+                    with open(output_path, "wb") as f:
+                        f.write(r.content)
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def download_pinterest_fallback(url, unique_id):
+    try:
+        r = http_session.get(url, allow_redirects=True, timeout=12)
+        html = r.text
+
+        mp4_matches = re.findall(r'https://v1\.pinimg\.com/videos/[^\s"\'<>]+\.mp4', html)
+        if mp4_matches:
+            video_url = mp4_matches[0].replace("\\u002F", "/")
+            vr = http_session.get(video_url, timeout=15)
+            if vr.status_code == 200:
+                out_path = os.path.join(DOWNLOAD_DIR, f"{unique_id}_pin.mp4")
+                with open(out_path, "wb") as f:
+                    f.write(vr.content)
+                return {"path": out_path, "title": "", "thumbnail": "", "ext": "mp4"}
+
+        img_match = (
+            re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html) or
+            re.search(r'<meta\s+name="og:image"\s+content="([^"]+)"', html) or
+            re.search(r'https://i\.pinimg\.com/originals/[^\s"\'<>]+\.(?:jpg|png|gif|webp)', html)
+        )
+        if img_match:
+            img_url = img_match.group(1) if img_match.lastindex else img_match.group(0)
+            ir = http_session.get(img_url, timeout=12)
+            if ir.status_code == 200:
+                ext = img_url.split("?")[0].split(".")[-1].lower()
+                if ext not in ["jpg", "jpeg", "png", "gif", "webp"]:
+                    ext = "jpg"
+                out_path = os.path.join(DOWNLOAD_DIR, f"{unique_id}_pin.{ext}")
+                with open(out_path, "wb") as f:
+                    f.write(ir.content)
+                return {"path": out_path, "title": "", "thumbnail": "", "ext": ext}
+    except Exception:
+        traceback.print_exc()
+    return None
+
+
+def download_via_ytdlp(url, output_template):
+    if "pinterest." in url:
+        url = re.sub(r'https?://([a-z]{2}\.)?pinterest\.[a-z.]+/', 'https://www.pinterest.com/', url)
+
+    ydl_opts = {
+        'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/bestvideo*+bestaudio/best',
+        'outtmpl': output_template,
+        'merge_output_format': 'mp4',
+        'noplaylist': True,
+        'quiet': True,
+        'no_warnings': True,
+        'ffmpeg_location': FFMPEG_PATH,
+        'concurrent_fragment_downloads': 8,
+        'buffersize': 1024 * 64,
+        'socket_timeout': 10,
+        'retries': 2,
+        'http_headers': HEADERS,
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        if 'entries' in info and info['entries']:
+            info = info['entries'][0]
+
+        filename = ydl.prepare_filename(info)
+        if not os.path.exists(filename):
+            base, _ = os.path.splitext(filename)
+            for ext_cand in [".mp4", ".mkv", ".webm", ".jpg", ".png", ".webp"]:
+                if os.path.exists(base + ext_cand):
+                    filename = base + ext_cand
+                    break
+
+        actual_ext = os.path.splitext(filename)[1].lstrip('.').lower() or info.get("ext", "mp4")
+        return {
+            "path": filename,
+            "title": info.get("title", ""),
+            "thumbnail": info.get("thumbnail", ""),
+            "ext": actual_ext
+        }
+
+
+def detect_platform(url):
+    u = url.lower()
+    if "tiktok.com" in u:                       return "TikTok"
+    if "instagram.com" in u:                    return "Instagram"
+    if "pinterest" in u or "pin.it" in u:       return "Pinterest"
+    if "soundcloud.com" in u:                   return "SoundCloud"
+    if "youtube.com" in u or "youtu.be" in u:   return "YouTube"
+    if "twitter.com" in u or "x.com" in u:      return "Twitter/X"
+    return "Источник"
+
+
+def clean_title(title):
+    if not title:
+        return ""
+    title = re.sub(r'(?i)pinterest\s+video\s*#?\s*\d+', '', title)
+    title = re.sub(r'(?i)instagram\s+(reels?\s+)?video\s*#?\s*\d+', '', title)
+    title = re.sub(r'(?i)tiktok\s+video\s*#?\s*\d+', '', title)
+    title = re.sub(r'^\s*#?\d{10,}\s*$', '', title)
+    return title.strip()
+
+
+def make_shazam_markup(video_path):
+    vid_id = hashlib.md5(video_path.encode()).hexdigest()[:16]
+    shazam_video_cache[vid_id] = video_path
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("🎵 Определить музыку", callback_data=f"shazam:{vid_id}"))
+    return markup
+
+
+def process_link_download(message, url, auto_shazam=False):
+    chat_id = message.chat.id
+    platform = detect_platform(url)
+
+    if "soundcloud.com" in url.lower() and not auto_shazam:
+        status_msg = bot.reply_to(message, "🔎")
+        def sc_handle():
+            try:
+                with YoutubeDL({'quiet': True, 'no_warnings': True, 'extract_flat': True}) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    title = (info.get('title') or '').strip()
+                    uploader = (info.get('uploader') or '').strip()
+                    q = f"{uploader} {title}".strip() if title else url
+                    show_track_selection(message, q, status_msg=status_msg)
+            except Exception:
+                show_track_selection(message, url, status_msg=status_msg)
+        threading.Thread(target=sc_handle, daemon=True).start()
+        return
+
+    status_msg = bot.reply_to(message, f'{E_DL} <i>Скачиваю с {platform}...</i>', parse_mode="HTML")
+
+    unique_id   = f"{chat_id}_{message.message_id}"
+    out_tmpl    = os.path.join(DOWNLOAD_DIR, f"{unique_id}.%(ext)s")
+    tiktok_path = os.path.join(DOWNLOAD_DIR, f"{unique_id}_tiktok.mp4")
+    file_path   = None
+
+    def process_url():
+        nonlocal file_path
+        try:
+            if "tiktok.com" in url:
+                if download_tiktok_api(url, tiktok_path):
+                    if auto_shazam:
+                        bot.edit_message_text("🔎", chat_id, status_msg.message_id)
+                        recognize_and_show_options(message, status_msg, tiktok_path, delete_source=True)
+                        return
+
+                    bot.edit_message_text(f'{E_SEND} <i>Отправляю...</i>', chat_id, status_msg.message_id, parse_mode="HTML")
+                    markup = make_shazam_markup(tiktok_path)
+                    with open(tiktok_path, "rb") as video:
+                        bot.send_video(chat_id, video, reply_markup=markup, reply_to_message_id=message.message_id, timeout=120)
+                    video_cache[unique_id] = tiktok_path
+                    bot.delete_message(chat_id, status_msg.message_id)
+                    return
+
+            media_info = None
+            try:
+                media_info = download_via_ytdlp(url, out_tmpl)
+            except Exception:
+                if platform == "Pinterest":
+                    media_info = download_pinterest_fallback(url, unique_id)
+                else:
+                    raise
+
+            if not media_info and platform == "Pinterest":
+                media_info = download_pinterest_fallback(url, unique_id)
+
+            if not media_info:
+                bot.edit_message_text("❌ Не получилось скачать", chat_id, status_msg.message_id)
+                return
+
+            file_path = media_info["path"]
+            thumb_url = media_info.get("thumbnail", "")
+
+            if file_path and os.path.exists(file_path):
+                if auto_shazam:
+                    bot.edit_message_text("🔎", chat_id, status_msg.message_id)
+                    recognize_and_show_options(message, status_msg, file_path, delete_source=True)
+                    return
+
+                bot.edit_message_text(f'{E_SEND} <i>Отправляю...</i>', chat_id, status_msg.message_id, parse_mode="HTML")
+                ext   = media_info["ext"].lower()
+                clean = clean_title(media_info.get("title", ""))
+
+                thumb_bytes = None
+                if thumb_url:
+                    try:
+                        r = http_session.get(thumb_url, timeout=5)
+                        if r.status_code == 200 and len(r.content) < 200 * 1024:
+                            thumb_bytes = r.content
+                    except Exception:
+                        pass
+
+                with open(file_path, "rb") as f:
+                    if ext in ["jpg", "jpeg", "png", "webp"]:
+                        bot.send_photo(chat_id, f, caption=clean or None, reply_to_message_id=message.message_id, timeout=60)
+                    elif ext == "gif":
+                        bot.send_animation(chat_id, f, caption=clean or None, reply_to_message_id=message.message_id, timeout=60)
+                    elif ext in ["mp3", "m4a", "ogg", "wav", "flac"]:
+                        bot.send_audio(chat_id, f, title=clean or None, thumbnail=thumb_bytes, reply_to_message_id=message.message_id, timeout=120)
+                    elif ext in ["mp4", "mkv", "mov", "webm"]:
+                        markup = make_shazam_markup(file_path)
+                        bot.send_video(chat_id, f, reply_markup=markup, reply_to_message_id=message.message_id, timeout=120)
+                    else:
+                        bot.send_document(chat_id, f, visible_file_name=f"{clean or 'media'}.{ext}", reply_to_message_id=message.message_id, timeout=120)
+
+                bot.delete_message(chat_id, status_msg.message_id)
+            else:
+                bot.edit_message_text("❌ Не получилось скачать", chat_id, status_msg.message_id)
+
+        except Exception:
+            traceback.print_exc()
+            try:
+                bot.edit_message_text("❌ Ошибка при скачивании по ссылке", chat_id, status_msg.message_id)
+            except Exception:
+                pass
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except Exception:
+                    pass
+            if os.path.exists(tiktok_path):
+                try:
+                    os.remove(tiktok_path)
+                except Exception:
+                    pass
+
+    threading.Thread(target=process_url, daemon=True).start()
+
+
+@bot.message_handler(func=lambda m: m.text is not None)
+def handle_all_text(message):
+    text = message.text.strip()
+    if not text or text.startswith('/start') or text.startswith('/help'):
+        return
+
+    chat_id = message.chat.id
+    is_private = message.chat.type == 'private'
+    save_storage_chat_id(chat_id)
+
+    url_match = re.search(r'https?://\S+', text)
+    has_search_prefix = bool(re.match(
+        r'^/?(?:найти|найди|поиск|ищи|скачать|скачай|шазам|shazam|песня|трек)\b',
+        text,
+        flags=re.IGNORECASE
+    ))
+
+    if url_match:
+        url = url_match.group(0)
+        process_link_download(message, url, auto_shazam=has_search_prefix)
+        return
+
+    if has_search_prefix and message.reply_to_message:
+        if extract_telegram_media_file_id(message.reply_to_message):
+            handle_telegram_media_shazam(message, message.reply_to_message)
+            return
+        reply_text = message.reply_to_message.text or message.reply_to_message.caption or ""
+        reply_url_match = re.search(r'https?://\S+', reply_text)
+        if reply_url_match:
+            process_link_download(message, reply_url_match.group(0), auto_shazam=True)
+            return
+
+    if has_search_prefix:
+        q_text = clean_search_query(text)
+        if not q_text and message.reply_to_message and message.reply_to_message.text:
+            q_text = message.reply_to_message.text.strip()
+        if len(q_text) >= 2:
+            show_track_selection(message, q_text)
+        return
+
+    if is_private and not text.startswith('/'):
+        if len(text) >= 2:
+            show_track_selection(message, text)
+
+
+if __name__ == '__main__':
+    print("Bot running...")
+    bot.remove_webhook()
+    bot.infinity_polling(timeout=30, long_polling_timeout=20, allowed_updates=["message", "callback_query"])
