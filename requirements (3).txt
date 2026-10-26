@@ -1,0 +1,7 @@
+pyTelegramBotAPI>=4.22.0
+requests>=2.31.0
+yt-dlp>=2024.10.7
+imageio-ffmpeg>=0.5.1
+shazamio>=0.7.0
+pydub>=0.25.1
+audioop-lts; python_version >= '3.13'
